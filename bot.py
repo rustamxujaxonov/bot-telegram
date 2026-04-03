@@ -225,24 +225,33 @@ async def stats(update, context):
 
 # ===== RUN =====
 def main():
-    import asyncio
-
-    asyncio.run(init())
-
     app = Application.builder().token(TOKEN).build()
 
+    # handlerlar
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handler))
 
-    print("🚀 BOT WEBHOOK MODE...")
+    print("🚀 BOT START...")
 
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=int(PORT),
-        url_path=TOKEN,
-        webhook_url=f"{WEBHOOK_URL}/{TOKEN}"
-    )
+    # INIT (DB + REDIS)
+    async def on_start(app):
+        await init()
+
+    app.post_init = on_start
+
+    # 👇 SHU JOYNI O'ZGARTIR
+    if WEBHOOK_URL:
+        print("🌐 WEBHOOK MODE")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=TOKEN,
+            webhook_url=f"{WEBHOOK_URL}/{TOKEN}",
+        )
+    else:
+        print("📡 POLLING MODE")
+        app.run_polling()
 
 
 if __name__ == "__main__":

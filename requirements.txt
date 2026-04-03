@@ -1,3 +1,4 @@
 python-telegram-bot==20.7
 asyncpg==0.29.0
 redis==5.0.1
+python==3.10.*
