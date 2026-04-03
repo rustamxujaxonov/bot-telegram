@@ -18,7 +18,7 @@ r = None
 
 user_last_message = {}
 
-bad_words = ["axuyet", "jalab", "yiban", "sex", "porn"]
+bad_words = ["fuckkkkkkkkkkkkk"]
 
 # ===== INIT =====
 async def init():
@@ -224,30 +224,29 @@ async def stats(update, context):
     await update.message.reply_text(f"👥 Users: {count}")
 
 # ===== RUN =====
-import asyncio
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
+TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+PORT = int(os.getenv("PORT", 8080))
+
+
+async def start(update, context):
+    await update.message.reply_text("Bot ishlayapti 🚀")
+
 
 async def main():
-    await init()
-
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handler))
 
     print("🚀 BOT WEBHOOK MODE...")
 
-    await app.initialize()
-    await app.start()
-
-    await app.bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
-
     await app.run_webhook(
         listen="0.0.0.0",
-        port=int(PORT),
+        port=PORT,
         url_path=TOKEN,
+        webhook_url=f"{WEBHOOK_URL}/{TOKEN}",
     )
+
 
 if __name__ == "__main__":
     asyncio.run(main())
