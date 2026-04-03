@@ -224,6 +224,9 @@ async def stats(update, context):
     await update.message.reply_text(f"👥 Users: {count}")
 
 # ===== RUN =====
+import asyncio
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
+
 async def main():
     await init()
 
@@ -233,12 +236,17 @@ async def main():
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handler))
 
-    await app.bot.set_webhook(f"{WEBHOOK_URL}/{TOKEN}")
+    print("🚀 BOT WEBHOOK MODE...")
+
+    await app.initialize()
+    await app.start()
+
+    await app.bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
 
     await app.run_webhook(
         listen="0.0.0.0",
-        port=PORT,
-        url_path=TOKEN
+        port=int(PORT),
+        url_path=TOKEN,
     )
 
 if __name__ == "__main__":
