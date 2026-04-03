@@ -2,8 +2,12 @@ import os
 import time
 import asyncpg
 import redis.asyncio as redis
+
 from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    filters, ContextTypes
+)
 
 TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -14,10 +18,7 @@ ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
 db = None
 r = None
-
 user_last_message = {}
-
-bad_words = ["fuckkkkkkkkkkkkk"]
 
 # ===== INIT =====
 async def init():
@@ -39,7 +40,7 @@ async def init():
         )
         """)
 
-# ===== USER =====
+# ===== DB =====
 async def get_user(uid):
     async with db.acquire() as conn:
         return await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", uid)
@@ -63,30 +64,28 @@ def kb(state):
 
     if state == "menu":
         return ReplyKeyboardMarkup([
-            ["🔎 Jins bo‘yicha qidirish"],
-            ["🎲 Random qidirish"],
+            ["🎯 Jins bo‘yicha qidirish"],
+            ["🎲 Random chat"],
             ["🔄 Jinsni o‘zgartirish"]
         ], resize_keyboard=True)
 
-    if state == "search_gender":
+    if state == "choose_gender":
         return ReplyKeyboardMarkup([
-            ["👨 O‘g‘il suhbatdosh"],
-            ["👩 Qiz suhbatdosh"],
+            ["👨 O‘g‘il bola"],
+            ["👩 Qiz bola"],
             ["🔙 Orqaga"]
-        ], resize_keyboard=True)
-
-    if state == "searching":
-        return ReplyKeyboardMarkup([
-            ["❌ Bekor qilish"]
         ], resize_keyboard=True)
 
     if state == "chat":
         return ReplyKeyboardMarkup([
-            ["⛔ Tugatish", "🔄 Keyingi"],
-            ["🚨 Shikoyat"]
+            ["⛔ Stop", "🔄 Next"],
+            ["🚨 Report"]
         ], resize_keyboard=True)
 
-# ===== SPAM =====
+# ===== HELPERS =====
+async def send_menu(update, text, state):
+    await update.message.reply_text(text, reply_markup=kb(state))
+
 def is_spam(uid):
     now = time.time()
     last = user_last_message.get(uid, 0)
@@ -104,43 +103,34 @@ async def find_match(uid, context):
     search = user["search"]
     gender = user["gender"]
 
-    # RANDOM
-    if search == "random":
-        partner = await r.lpop("queue:random")
+    queue = f"queue:{search}"
+    partner = await r.lpop(queue)
 
-        if partner:
-            partner = int(partner)
-        else:
-            await r.rpush("queue:random", uid)
-            return False
+    if not partner and search == "any":
+        # random fallback
+        partner = await r.lpop("queue:male") or await r.lpop("queue:female")
 
-    else:
-        partner = await r.lpop(f"queue:{search}")
-
-        if not partner:
-            await r.rpush(f"queue:{gender}", uid)
-            return False
-
+    if partner:
         partner = int(partner)
 
-    # CONNECT
-    await update_user(uid, "partner", partner)
-    await update_user(partner, "partner", uid)
+        await update_user(uid, "partner", partner)
+        await update_user(partner, "partner", uid)
 
-    await update_user(uid, "state", "chat")
-    await update_user(partner, "state", "chat")
+        await update_user(uid, "state", "chat")
+        await update_user(partner, "state", "chat")
 
-    await context.bot.send_message(uid, "✅ Suhbat boshlandi", reply_markup=kb("chat"))
-    await context.bot.send_message(partner, "✅ Suhbat boshlandi", reply_markup=kb("chat"))
+        await context.bot.send_message(uid, "✅ Chat boshlandi", reply_markup=kb("chat"))
+        await context.bot.send_message(partner, "✅ Chat boshlandi", reply_markup=kb("chat"))
+        return True
 
-    return True
+    await r.rpush(queue, uid)
+    return False
 
 # ===== START =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     await create_user(uid)
-
-    await update.message.reply_text("👋 Jinsni tanlang", reply_markup=kb("gender"))
+    await send_menu(update, "👋 Jinsni tanlang", "gender")
 
 # ===== MAIN HANDLER =====
 async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -152,14 +142,6 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await create_user(uid)
     user = await get_user(uid)
-
-    # BAN
-    if user["banned_until"] > int(time.time()):
-        return await update.message.reply_text("🚫 Siz bloklangansiz")
-
-    if any(w in text.lower() for w in bad_words):
-        await update_user(uid, "banned_until", int(time.time()) + 86400)
-        return await update.message.reply_text("🚫 24 soat blok")
 
     state = user["state"]
 
@@ -173,58 +155,44 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await update_user(uid, "state", "menu")
-        return await update.message.reply_text("Menu", reply_markup=kb("menu"))
+        return await send_menu(update, "🏠 Menyu", "menu")
 
     # ===== MENU =====
     elif state == "menu":
 
-        if text == "🔎 Jins bo‘yicha qidirish":
-            await update_user(uid, "state", "search_gender")
-            return await update.message.reply_text("Kimni qidirasiz?", reply_markup=kb("search_gender"))
+        if text == "🎯 Jins bo‘yicha qidirish":
+            await update_user(uid, "state", "choose_gender")
+            return await send_menu(update, "Kimni qidirasiz?", "choose_gender")
 
-        elif text == "🎲 Random qidirish":
-            await update_user(uid, "search", "random")
+        elif text == "🎲 Random chat":
+            await update_user(uid, "search", "any")
             await update_user(uid, "state", "searching")
 
-            await update.message.reply_text("🎲 Qidirilmoqda...", reply_markup=kb("searching"))
-
-            found = await find_match(uid, context)
-            if not found:
-                await update.message.reply_text("⌛ Kutilmoqda...")
+            await update.message.reply_text("⏳ Random qidirilmoqda...")
+            await find_match(uid, context)
 
         elif text == "🔄 Jinsni o‘zgartirish":
             await update_user(uid, "state", "gender")
-            return await update.message.reply_text("Jinsni tanlang", reply_markup=kb("gender"))
+            return await send_menu(update, "Jinsni tanlang", "gender")
 
-    # ===== SEARCH GENDER =====
-    elif state == "search_gender":
+    # ===== CHOOSE GENDER =====
+    elif state == "choose_gender":
 
-        if text == "👨 O‘g‘il suhbatdosh":
+        if text == "🔙 Orqaga":
+            await update_user(uid, "state", "menu")
+            return await send_menu(update, "🏠 Menyu", "menu")
+
+        elif text == "👨 O‘g‘il bola":
             await update_user(uid, "search", "male")
 
-        elif text == "👩 Qiz suhbatdosh":
+        elif text == "👩 Qiz bola":
             await update_user(uid, "search", "female")
-
-        elif text == "🔙 Orqaga":
-            await update_user(uid, "state", "menu")
-            return await update.message.reply_text("Menu", reply_markup=kb("menu"))
         else:
             return
 
         await update_user(uid, "state", "searching")
-
-        await update.message.reply_text("⏳ Qidirilmoqda...", reply_markup=kb("searching"))
-
-        found = await find_match(uid, context)
-        if not found:
-            await update.message.reply_text("⌛ Kutilmoqda...")
-
-    # ===== SEARCHING =====
-    elif state == "searching":
-
-        if text == "❌ Bekor qilish":
-            await update_user(uid, "state", "menu")
-            return await update.message.reply_text("❌ Bekor qilindi", reply_markup=kb("menu"))
+        await update.message.reply_text("⏳ Qidirilmoqda...")
+        await find_match(uid, context)
 
     # ===== CHAT =====
     elif state == "chat":
@@ -232,10 +200,9 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not partner:
             await update_user(uid, "state", "menu")
-            return
+            return await send_menu(update, "🏠 Menyu", "menu")
 
-        # STOP
-        if text == "⛔ Tugatish":
+        if text == "⛔ Stop":
             await update_user(uid, "state", "menu")
             await update_user(uid, "partner", None)
 
@@ -243,14 +210,14 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update_user(partner, "partner", None)
 
             await context.bot.send_message(partner, "❌ Chat tugadi", reply_markup=kb("menu"))
-            return await update.message.reply_text("❌ Tugadi", reply_markup=kb("menu"))
+            return await send_menu(update, "❌ Tugadi", "menu")
 
-        # NEXT
-        if text == "🔄 Keyingi":
+        if text == "🔄 Next":
             await update_user(uid, "partner", None)
             await update_user(uid, "state", "searching")
 
             await context.bot.send_message(partner, "❌ Suhbatdosh chiqib ketdi", reply_markup=kb("menu"))
+
             await update_user(partner, "partner", None)
             await update_user(partner, "state", "menu")
 
@@ -258,22 +225,16 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await find_match(uid, context)
             return
 
-        # REPORT
-        if text == "🚨 Shikoyat":
+        if text == "🚨 Report":
             reports = user["reports"] + 1
             await update_user(partner, "reports", reports)
 
-            if reports >= 20:
-                await update_user(partner, "banned_until", int(time.time()) + 86400)
-                await context.bot.send_message(partner, "🚫 24 soat blok")
-
             return await update.message.reply_text("🚨 Shikoyat yuborildi")
 
-        # MESSAGE
         await context.bot.send_message(partner, text)
 
 # ===== ADMIN =====
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stats(update, context):
     if update.effective_user.id != ADMIN_ID:
         return
 
@@ -290,12 +251,12 @@ def main():
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handler))
 
-    print("🚀 BOT START...")
-
     async def on_start(app):
         await init()
 
     app.post_init = on_start
+
+    print("🚀 BOT START...")
 
     if WEBHOOK_URL:
         print("🌐 WEBHOOK MODE")
@@ -306,7 +267,7 @@ def main():
             webhook_url=f"{WEBHOOK_URL}/{TOKEN}",
         )
     else:
-        print("📡 POLLING MODE")
+        print("💻 POLLING MODE")
         app.run_polling()
 
 
