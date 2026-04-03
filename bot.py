@@ -224,29 +224,26 @@ async def stats(update, context):
     await update.message.reply_text(f"👥 Users: {count}")
 
 # ===== RUN =====
-TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-PORT = int(os.getenv("PORT", 8080))
+def main():
+    import asyncio
 
+    asyncio.run(init())
 
-async def start(update, context):
-    await update.message.reply_text("Bot ishlayapti 🚀")
-
-
-async def main():
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handler))
 
     print("🚀 BOT WEBHOOK MODE...")
 
-    await app.run_webhook(
+    app.run_webhook(
         listen="0.0.0.0",
-        port=PORT,
+        port=int(PORT),
         url_path=TOKEN,
-        webhook_url=f"{WEBHOOK_URL}/{TOKEN}",
+        webhook_url=f"{WEBHOOK_URL}/{TOKEN}"
     )
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
