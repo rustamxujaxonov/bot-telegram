@@ -2,261 +2,224 @@ import os
 import time
 import asyncpg
 import redis.asyncio as redis
-
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    filters, ContextTypes
-)
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# ===== CONFIG =====
+# Sozlamalar
 TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 REDIS_URL = os.getenv("REDIS_URL")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-PORT = int(os.getenv("PORT", 8080))
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 
 db = None
 r = None
-last_msg = {}
 
-# ===== INIT =====
+# ===== DATABASE VA REDIS =====
 async def init():
     global db, r
-
     db = await asyncpg.create_pool(DATABASE_URL)
-    r = redis.from_url(REDIS_URL)
+    r = redis.from_url(REDIS_URL, decode_responses=True)
 
     async with db.acquire() as conn:
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
             gender TEXT,
-            search TEXT,
+            search_pref TEXT,
             state TEXT,
-            partner BIGINT
+            partner BIGINT,
+            banned_until BIGINT DEFAULT 0,
+            reports INT DEFAULT 0
         )
         """)
 
-# ===== DB =====
+# ===== YORDAMCHI FUNKSIYALAR =====
 async def get_user(uid):
     async with db.acquire() as conn:
         return await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", uid)
 
-async def create_user(uid):
+async def update_user(uid, **kwargs):
+    cols = ", ".join([f"{k}=${i+2}" for i, k in enumerate(kwargs.keys())])
+    vals = list(kwargs.values())
     async with db.acquire() as conn:
-        await conn.execute("""
-        INSERT INTO users (user_id, state)
-        VALUES ($1, 'gender')
-        ON CONFLICT DO NOTHING
-        """, uid)
+        await conn.execute(f"UPDATE users SET {cols} WHERE user_id=$1", uid, *vals)
 
-async def set_user(uid, field, value):
-    async with db.acquire() as conn:
-        await conn.execute(f"UPDATE users SET {field}=$1 WHERE user_id=$2", value, uid)
+# ===== KEYBOARD =====
+def get_kb(state):
+    if state == "gender":
+        return ReplyKeyboardMarkup([["👨 Erkak", "👩 Ayol"]], resize_keyboard=True)
+    
+    if state == "menu":
+        return ReplyKeyboardMarkup([
+            ["🔎 Jins bo‘yicha qidirish"],
+            ["🎲 Random qidirish"],
+            ["🔄 Jinsni o‘zgartirish"]
+        ], resize_keyboard=True)
+    
+    if state == "search_gender":
+        return ReplyKeyboardMarkup([
+            ["👨 O‘g‘il qidirish", "👩 Qiz qidirish"],
+            ["🔙 Orqaga"]
+        ], resize_keyboard=True)
+    
+    if state == "searching":
+        return ReplyKeyboardMarkup([["❌ Bekor qilish"]], resize_keyboard=True)
+    
+    if state == "chat":
+        return ReplyKeyboardMarkup([
+            ["⛔ Tugatish", "🔄 Keyingi"],
+            ["🚨 Shikoyat"]
+        ], resize_keyboard=True)
+    
+    return ReplyKeyboardRemove()
 
-# ===== KEYBOARDS =====
-def kb_gender():
-    return ReplyKeyboardMarkup([["👨 Erkak", "👩 Ayol"]], resize_keyboard=True)
-
-def kb_menu():
-    return ReplyKeyboardMarkup([
-        ["🎯 Jins bo‘yicha"],
-        ["🎲 Random"],
-        ["🔄 Jinsni o‘zgartirish"]
-    ], resize_keyboard=True)
-
-def kb_choose():
-    return ReplyKeyboardMarkup([
-        ["👨 O‘g‘il bola", "👩 Qiz bola"],
-        ["🔙 Orqaga"]
-    ], resize_keyboard=True)
-
-def kb_chat():
-    return ReplyKeyboardMarkup([
-        ["⛔ Stop", "🔄 Next"],
-        ["🚨 Report"]
-    ], resize_keyboard=True)
-
-# ===== HELPERS =====
-def spam(uid):
-    now = time.time()
-    if now - last_msg.get(uid, 0) < 0.4:
-        return True
-    last_msg[uid] = now
-    return False
-
-async def send(update, text, kb=None):
-    await update.message.reply_text(text, reply_markup=kb)
-
-# ===== MATCH =====
-async def match(uid, context):
+# ===== MATCHMAKING LOGIC =====
+async def find_match(uid, context: ContextTypes.DEFAULT_TYPE):
     user = await get_user(uid)
-    search = user["search"]
+    my_gender = user['gender']
+    pref = user['search_pref'] # 'male', 'female' yoki 'random'
 
-    partner = await r.lpop(f"q:{search}")
+    # Navbat kalitini aniqlash
+    # Agar men random qidirsam, 'queue:random' ga tushaman
+    # Agar jins bo'yicha qidirsam (masalan qiz), 'queue:female' ga tushaman
+    queue_key = f"queue:{pref}"
+    
+    # Hamroh qidirish
+    # Agarda men 'female' qidirayotgan bo'lsam, queue:male ichidan o'zimni kutayotgan ayolni qidiraman
+    search_in = f"queue:{my_gender}" if pref != "random" else "queue:random"
+    
+    # Redisdan bitta odamni olish
+    partner_id = await r.lpop(search_in)
 
-    if not partner and search == "any":
-        partner = await r.lpop("q:male") or await r.lpop("q:female")
+    if partner_id:
+        partner_id = int(partner_id)
+        if partner_id == uid: # O'zi chiqib qolsa (kamdan kam holat)
+            return False
 
-    if partner:
-        partner = int(partner)
+        # Ulash
+        await update_user(uid, partner=partner_id, state="chat")
+        await update_user(partner_id, partner=uid, state="chat")
 
-        await set_user(uid, "partner", partner)
-        await set_user(partner, "partner", uid)
-
-        await set_user(uid, "state", "chat")
-        await set_user(partner, "state", "chat")
-
-        await context.bot.send_message(uid, "✅ Chat boshlandi", reply_markup=kb_chat())
-        await context.bot.send_message(partner, "✅ Chat boshlandi", reply_markup=kb_chat())
+        await context.bot.send_message(uid, "✅ Suhbatdosh topildi!", reply_markup=get_kb("chat"))
+        await context.bot.send_message(partner_id, "✅ Suhbatdosh topildi!", reply_markup=get_kb("chat"))
         return True
+    else:
+        # Navbatga turish
+        # Agar random bo'lsa queue:random ga, aks holda o'z jinsi bo'yicha navbatga turadi
+        # Chunki qarama-qarshi jins aynan shu jinsni qidiradi
+        await r.rpush(queue_key, uid)
+        return False
 
-    await r.rpush(f"q:{search}", uid)
-    return False
-
-# ===== START =====
+# ===== HANDLERS =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    await create_user(uid)
+    user = await get_user(uid)
+    
+    if not user:
+        async with db.acquire() as conn:
+            await conn.execute("INSERT INTO users (user_id, state) VALUES ($1, 'gender')", uid)
+        await update.message.reply_text("Salom! Avval jinsingizni tanlang:", reply_markup=get_kb("gender"))
+    else:
+        await update_user(uid, state="menu", partner=None)
+        await update.message.reply_text("Asosiy menu:", reply_markup=get_kb("menu"))
 
-    await send(update, "👋 Jinsni tanlang", kb_gender())
-
-# ===== MAIN =====
-async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = update.message.text
+    user = await get_user(uid)
 
-    if spam(uid):
+    if not user: return
+    state = user['state']
+
+    # 1. JINS TANLASH
+    if state == "gender":
+        if text == "👨 Erkak":
+            await update_user(uid, gender="male", state="menu")
+            await update.message.reply_text("Profil saqlandi. Menyu:", reply_markup=get_kb("menu"))
+        elif text == "👩 Ayol":
+            await update_user(uid, gender="female", state="menu")
+            await update.message.reply_text("Profil saqlandi. Menyu:", reply_markup=get_kb("menu"))
         return
 
-    await create_user(uid)
-    user = await get_user(uid)
-    state = user["state"]
-
-    # ===== GENDER =====
-    if state == "gender":
-
-        if text == "👨 Erkak":
-            await set_user(uid, "gender", "male")
-        elif text == "👩 Ayol":
-            await set_user(uid, "gender", "female")
-        else:
-            return
-
-        await set_user(uid, "state", "menu")
-
-        # 🔥 eski keyboardni olib tashlaymiz
-        await update.message.reply_text("✅ Saqlandi", reply_markup=ReplyKeyboardRemove())
-
-        return await send(update, "🏠 Menyu", kb_menu())
-
-    # ===== MENU =====
+    # 2. MENU
     if state == "menu":
+        if text == "🔎 Jins bo‘yicha qidirish":
+            await update_user(uid, state="search_gender")
+            await update.message.reply_text("Kimni qidiramiz?", reply_markup=get_kb("search_gender"))
+        elif text == "🎲 Random qidirish":
+            await update_user(uid, state="searching", search_pref="random")
+            await update.message.reply_text("🎲 Hamroh qidirilmoqda...", reply_markup=get_kb("searching"))
+            await find_match(uid, context)
+        elif text == "🔄 Jinsni o‘zgartirish":
+            await update_user(uid, state="gender")
+            await update.message.reply_text("Jinsingizni qayta tanlang:", reply_markup=get_kb("gender"))
+        return
 
-        if text == "🎯 Jins bo‘yicha":
-            await set_user(uid, "state", "choose")
-            return await send(update, "Kimni qidirasiz?", kb_choose())
-
-        if text == "🎲 Random":
-            await set_user(uid, "search", "any")
-            await set_user(uid, "state", "search")
-
-            await send(update, "⏳ Random qidirilmoqda...")
-            await match(uid, context)
-            return
-
-        if text == "🔄 Jinsni o‘zgartirish":
-            await set_user(uid, "state", "gender")
-            return await send(update, "Jinsni tanlang", kb_gender())
-
-    # ===== CHOOSE =====
-    if state == "choose":
-
+    # 3. JINS BO'YICHA QIDIRUV TANLOVI
+    if state == "search_gender":
         if text == "🔙 Orqaga":
-            await set_user(uid, "state", "menu")
-            return await send(update, "🏠 Menyu", kb_menu())
+            await update_user(uid, state="menu")
+            await update.message.reply_text("Menyu:", reply_markup=get_kb("menu"))
+        elif text in ["👨 O‘g‘il qidirish", "👩 Qiz qidirish"]:
+            pref = "male" if "O‘g‘il" in text else "female"
+            await update_user(uid, state="searching", search_pref=pref)
+            await update.message.reply_text("🔎 Mos hamroh qidirilmoqda...", reply_markup=get_kb("searching"))
+            await find_match(uid, context)
+        return
 
-        if text == "👨 O‘g‘il bola":
-            await set_user(uid, "search", "male")
+    # 4. QIDIRUV JARAYONI
+    if state == "searching":
+        if text == "❌ Bekor qilish":
+            pref = user['search_pref']
+            await r.lrem(f"queue:{pref}", 0, str(uid)) # Navbatdan o'chirish
+            await update_user(uid, state="menu")
+            await update.message.reply_text("Qidiruv bekor qilindi.", reply_markup=get_kb("menu"))
+        return
 
-        elif text == "👩 Qiz bola":
-            await set_user(uid, "search", "female")
-        else:
-            return
-
-        await set_user(uid, "state", "search")
-
-        await send(update, "⏳ Qidirilmoqda...")
-        await match(uid, context)
-
-    # ===== CHAT =====
+    # 5. CHAT JARAYONI
     if state == "chat":
-        partner = user["partner"]
+        partner_id = user['partner']
+        
+        if text == "⛔ Tugatish":
+            await update_user(uid, state="menu", partner=None)
+            await update_user(partner_id, state="menu", partner=None)
+            await update.message.reply_text("Suhbat tugatildi.", reply_markup=get_kb("menu"))
+            await context.bot.send_message(partner_id, "Suhbatdosh suhbatni tugatdi.", reply_markup=get_kb("menu"))
+        
+        elif text == "🔄 Keyingi":
+            # Hamkorni xabardor qilish
+            await update_user(partner_id, state="menu", partner=None)
+            await context.bot.send_message(partner_id, "Suhbatdosh keyingi suhbatga o'tib ketdi.", reply_markup=get_kb("menu"))
+            
+            # O'zini qayta qidiruvga berish
+            await update_user(uid, state="searching")
+            await update.message.reply_text("Yangi hamroh qidirilmoqda...", reply_markup=get_kb("searching"))
+            await find_match(uid, context)
 
-        if not partner:
-            await set_user(uid, "state", "menu")
-            return await send(update, "🏠 Menyu", kb_menu())
+        elif text == "🚨 Shikoyat":
+            await update_user(partner_id, reports=user['reports']+1)
+            await update.message.reply_text("Shikoyat qabul qilindi.")
+            
+        else:
+            # Xabarni yuborish
+            try:
+                await context.bot.send_message(partner_id, text)
+            except:
+                await update_user(uid, state="menu", partner=None)
+                await update.message.reply_text("Suhbatdosh botdan chiqib ketgan ko'rinadi.", reply_markup=get_kb("menu"))
 
-        # STOP
-        if text == "⛔ Stop":
-            await set_user(uid, "partner", None)
-            await set_user(uid, "state", "menu")
-
-            await set_user(partner, "partner", None)
-            await set_user(partner, "state", "menu")
-
-            await context.bot.send_message(partner, "❌ Chat tugadi", reply_markup=kb_menu())
-            return await send(update, "❌ Tugadi", kb_menu())
-
-        # NEXT
-        if text == "🔄 Next":
-            await set_user(uid, "partner", None)
-            await set_user(uid, "state", "search")
-
-            await context.bot.send_message(partner, "❌ Suhbat tugadi", reply_markup=kb_menu())
-
-            await set_user(partner, "partner", None)
-            await set_user(partner, "state", "menu")
-
-            await send(update, "🔄 Qidirilmoqda...")
-            await match(uid, context)
-            return
-
-        # REPORT
-        if text == "🚨 Report":
-            await send(update, "🚨 Shikoyat yuborildi")
-            return
-
-        # MESSAGE
-        await context.bot.send_message(partner, text)
-
-# ===== RUN =====
+# ===== ASOSIY ISHGA TUSHIRISH =====
 def main():
     app = Application.builder().token(TOKEN).build()
-
+    
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-    async def startup(app):
+    async def setup(application):
         await init()
 
-    app.post_init = startup
-
-    print("🚀 BOT START")
-
-    if WEBHOOK_URL:
-        print("🌐 WEBHOOK")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=TOKEN,
-            webhook_url=f"{WEBHOOK_URL}/{TOKEN}",
-        )
-    else:
-        print("💻 POLLING")
-        app.run_polling()
-
+    app.post_init = setup
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
