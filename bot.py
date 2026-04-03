@@ -13,7 +13,10 @@ REDIS_URL = os.getenv("REDIS_URL")
 db = None
 r = None
 
-# ===== DATABASE VA REDIS =====
+# Haqoratli so'zlar ro'yxati
+BAD_WORDS = ["axuyet", "jalab", "yiban", "so'kinish1", "so'kinish2"]
+
+# ===== DATABASE VA REDIS INIT =====
 async def init():
     global db, r
     db = await asyncpg.create_pool(DATABASE_URL)
@@ -27,7 +30,8 @@ async def init():
             search_pref TEXT,
             state TEXT,
             partner BIGINT,
-            reports INT DEFAULT 0
+            reports INT DEFAULT 0,
+            is_banned BOOLEAN DEFAULT FALSE
         )
         """)
 
@@ -70,13 +74,13 @@ def get_kb(state):
     
     return ReplyKeyboardRemove()
 
-# ===== MATCHMAKING =====
+# ===== MATCHMAKING LOGIC =====
 async def find_match(uid, context: ContextTypes.DEFAULT_TYPE):
     user = await get_user(uid)
     my_gender = user['gender']
     pref = user['search_pref']
 
-    # Qidiruv logikasi
+    # Navbat kalitlari
     queue_key = f"queue:{pref}"
     search_in = f"queue:{my_gender}" if pref != "random" else "queue:random"
     
@@ -85,11 +89,14 @@ async def find_match(uid, context: ContextTypes.DEFAULT_TYPE):
     if partner_id:
         partner_id = int(partner_id)
         
+        # O'zini o'zi topib olmaslik uchun tekshiruv
+        if partner_id == uid:
+            return False
+
         await update_user(uid, partner=partner_id, state="chat")
         await update_user(partner_id, partner=uid, state="chat")
 
-        # Har ikki tomonga xabar yuborish
-        msg = "🎉 **Suhbatdosh topildi!**\n\nEndi bemalol yozishingiz mumkin. O'zaro hurmatni saqlang.\n\n_Tugmalar vazifasi:_\n⛔ **Tugatish** - Suhbatni butunlay to'xtatish.\n🔄 **Keyingi** - Hozirgi suhbatni tugatib, darhol yangisini qidirish.\n🚨 **Shikoyat** - Nojo'ya xatti-harakatlar haqida xabar berish."
+        msg = "🎉 **Suhbatdosh topildi!**\n\nMarhamat, suhbatni boshlashingiz mumkin.\n\n_Tugmalar:_\n⛔ **Tugatish** - Chatni yopish\n🔄 **Keyingi** - Yangi odam qidirish\n🚨 **Shikoyat** - Bloklash uchun"
         
         await context.bot.send_message(uid, msg, reply_markup=get_kb("chat"), parse_mode="Markdown")
         await context.bot.send_message(partner_id, msg, reply_markup=get_kb("chat"), parse_mode="Markdown")
@@ -98,52 +105,49 @@ async def find_match(uid, context: ContextTypes.DEFAULT_TYPE):
         await r.rpush(queue_key, uid)
         return False
 
-# ===== HANDLERS =====
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    user = await get_user(uid)
-    
-    welcome_text = "👋 **Anonim Chat Botga xush kelibsiz!**\n\nBu yerda siz o'zligingizni oshkor qilmagan holda yangi do'stlar orttirishingiz mumkin."
-    
-    if not user:
-        async with db.acquire() as conn:
-            await conn.execute("INSERT INTO users (user_id, state) VALUES ($1, 'gender')", uid)
-        await update.message.reply_text(f"{welcome_text}\n\nIltimos, avval jinsingizni tanlang:", reply_markup=get_kb("gender"), parse_mode="Markdown")
-    else:
-        await update_user(uid, state="menu", partner=None)
-        await update.message.reply_text("Siz yana asosiy menyudasiz. Kim bilan suhbatlashmoqchisiz?", reply_markup=get_kb("menu"), parse_mode="Markdown")
-
+# ===== MESSAGE HANDLER =====
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = update.message.text
+    
     user = await get_user(uid)
+    if not user:
+        return # Start bosilmagan bo'lsa
 
-    if not user: return
+    # 1. BLOK TEKSHIRUVI
+    if user['is_banned']:
+        return await update.message.reply_text("🚫 Siz qoidalarni buzganingiz uchun botdan bloklangansiz!")
+
+    # 2. HAQORAT FILTRI
+    if text and any(word in text.lower() for word in BAD_WORDS):
+        await update_user(uid, is_banned=True)
+        return await update.message.reply_text("🚫 Haqoratli so'z ishlatganingiz uchun bloklandingiz!")
+
     state = user['state']
 
-    # JINS TANLASH
+    # GENDER
     if state == "gender":
         if text in ["👨 Erkak", "👩 Ayol"]:
             gender_val = "male" if "Erkak" in text else "female"
             await update_user(uid, gender=gender_val, state="menu")
-            await update.message.reply_text("✅ Jinsingiz saqlandi!\n\n**Menyu tushuntirishi:**\n🔎 **Jins bo'yicha** - Faqat o'g'il yoki faqat qiz bolani qidirish.\n🎲 **Random** - Kim bo'sh bo'lsa shuni topish.\n🔄 **O'zgartirish** - Jinsingizni qayta belgilash.", reply_markup=get_kb("menu"), parse_mode="Markdown")
+            await update.message.reply_text("✅ Jinsingiz saqlandi. Menyu:", reply_markup=get_kb("menu"))
         return
 
     # MENU
     if state == "menu":
         if text == "🔎 Jins bo‘yicha qidirish":
             await update_user(uid, state="search_gender")
-            await update.message.reply_text("Kim bilan suhbatlashmoqchisiz? Tanlang:", reply_markup=get_kb("search_gender"))
+            await update.message.reply_text("Kim bilan suhbatlashmoqchisiz?", reply_markup=get_kb("search_gender"))
         elif text == "🎲 Random qidirish":
             await update_user(uid, state="searching", search_pref="random")
-            await update.message.reply_text("🔍 **Suhbatdosh qidirilyapti...**\n\nIltimos, kuting. Kimdir bog'lanishi bilan sizga xabar beramiz.", reply_markup=get_kb("searching"), parse_mode="Markdown")
+            await update.message.reply_text("🔍 **Suhbatdosh qidirilyapti...**", reply_markup=get_kb("searching"), parse_mode="Markdown")
             await find_match(uid, context)
         elif text == "🔄 Jinsni o‘zgartirish":
             await update_user(uid, state="gender")
-            await update.message.reply_text("Jinsingizni qayta tanlang:", reply_markup=get_kb("gender"))
+            await update.message.reply_text("Jinsingizni tanlang:", reply_markup=get_kb("gender"))
         return
 
-    # JINS QIDIRUV TANLOVI
+    # SEARCH GENDER
     if state == "search_gender":
         if text == "🔙 Orqaga":
             await update_user(uid, state="menu")
@@ -151,49 +155,76 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif text in ["👨 O‘g‘il qidirish", "👩 Qiz qidirish"]:
             pref = "male" if "O‘g‘il" in text else "female"
             await update_user(uid, state="searching", search_pref=pref)
-            await update.message.reply_text(f"🔍 **{text.split()[-2]} qidirilyapti...**\n\nBu biroz vaqt olishi mumkin.", reply_markup=get_kb("searching"), parse_mode="Markdown")
+            await update.message.reply_text(f"🔍 **{text} boshlandi...**", reply_markup=get_kb("searching"), parse_mode="Markdown")
             await find_match(uid, context)
         return
 
-    # QIDIRUV JARAYONI
+    # SEARCHING
     if state == "searching":
         if text == "❌ Bekor qilish":
             pref = user['search_pref']
             await r.lrem(f"queue:{pref}", 0, str(uid))
             await update_user(uid, state="menu")
-            await update.message.reply_text("Qidiruv to'xtatildi. Menyu:", reply_markup=get_kb("menu"))
+            await update.message.reply_text("❌ Qidiruv to'xtatildi.", reply_markup=get_kb("menu"))
         return
 
-    # CHAT JARAYONI
+    # CHAT
     if state == "chat":
         partner_id = user['partner']
         
         if text == "⛔ Tugatish":
             await update_user(uid, state="menu", partner=None)
             await update_user(partner_id, state="menu", partner=None)
-            await update.message.reply_text("❌ **Suhbat tugatildi.**\n\nYangi suhbat boshlash uchun menyudan foydalaning.", reply_markup=get_kb("menu"), parse_mode="Markdown")
-            await context.bot.send_message(partner_id, "❌ **Suhbatdosh suhbatni tugatdi.**\n\nYana qidirishni xohlaysizmi?", reply_markup=get_kb("menu"), parse_mode="Markdown")
+            await update.message.reply_text("❌ Suhbat tugadi.", reply_markup=get_kb("menu"))
+            await context.bot.send_message(partner_id, "❌ Suhbatdosh suhbatni tugatdi.", reply_markup=get_kb("menu"))
         
         elif text == "🔄 Keyingi":
             await update_user(partner_id, state="menu", partner=None)
-            await context.bot.send_message(partner_id, "⚠️ **Suhbatdosh suhbatni tark etib, boshqa suhbatdosh qidirishga o'tdi.**", reply_markup=get_kb("menu"), parse_mode="Markdown")
+            await context.bot.send_message(partner_id, "⚠️ Suhbatdosh boshqa chatga o'tib ketdi.", reply_markup=get_kb("menu"))
             
             await update_user(uid, state="searching")
-            await update.message.reply_text("🔄 **Keyingi suhbatdosh qidirilyapti...**", reply_markup=get_kb("searching"), parse_mode="Markdown")
+            await update.message.reply_text("🔄 Yangi suhbatdosh qidirilyapti...", reply_markup=get_kb("searching"))
             await find_match(uid, context)
 
         elif text == "🚨 Shikoyat":
-            await update_user(partner_id, reports=user['reports']+1)
-            await update.message.reply_text("🚨 **Shikoyatingiz qabul qilindi.**\n\nMa'muriyat ko'rib chiqadi. Suhbatni davom ettirishingiz mumkin.")
+            new_reports = user['reports'] + 1
+            await update_user(partner_id, reports=new_reports)
+            
+            # Agar shikoyatlar 3 tadan oshsa bloklash
+            if new_reports >= 20:
+                await update_user(partner_id, is_banned=True, state="menu", partner=None)
+                await context.bot.send_message(partner_id, "🚫 Sizga ko'p shikoyat tushgani uchun bloklandingiz!")
+            
+            # Chatni darhol yopish (shikoyatdan so'ng)
+            await update_user(uid, state="menu", partner=None)
+            await update_user(partner_id, state="menu", partner=None)
+            await update.message.reply_text("🚨 Shikoyat yuborildi va suhbat yopildi.", reply_markup=get_kb("menu"))
+            await context.bot.send_message(partner_id, "❌ Suhbatdosh sizdan shikoyat qildi va chatni tark etdi.", reply_markup=get_kb("menu"))
             
         else:
-            # Oddiy xabarlarni yuborish
+            # Xabarni sherigiga yuborish
             try:
                 await context.bot.send_message(partner_id, text)
             except:
                 await update_user(uid, state="menu", partner=None)
-                await update.message.reply_text("⚠️ Suhbatdosh bilan aloqa uzildi.", reply_markup=get_kb("menu"))
+                await update.message.reply_text("⚠️ Suhbatdosh botdan chiqib ketgan ko'rinadi.", reply_markup=get_kb("menu"))
 
+# ===== START COMMAND =====
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = await get_user(uid)
+    
+    if not user:
+        async with db.acquire() as conn:
+            await conn.execute("INSERT INTO users (user_id, state) VALUES ($1, 'gender')", uid)
+        await update.message.reply_text("👋 Xush kelibsiz! Avval jinsingizni tanlang:", reply_markup=get_kb("gender"))
+    else:
+        if user['is_banned']:
+            return await update.message.reply_text("🚫 Siz bloklangansiz!")
+        await update_user(uid, state="menu", partner=None)
+        await update.message.reply_text("Asosiy menyuga qaytdingiz:", reply_markup=get_kb("menu"))
+
+# ===== RUN BOT =====
 def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
