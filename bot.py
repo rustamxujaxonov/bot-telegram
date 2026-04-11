@@ -2,10 +2,10 @@ import os
 import logging
 import asyncpg
 import redis.asyncio as redis
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
-# Loggingni sozlash (xatoliklarni terminalda ko'rish uchun)
+# Logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -14,8 +14,12 @@ TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 REDIS_URL = os.getenv("REDIS_URL")
 
-# Haqoratli so'zlar (kengaytirishingiz mumkin)
-BAD_WORDS = ["fisiisnknskdnsksndsiskcn"]
+# --- TO'LOV SOZLAMALARI ---
+ADMIN_ID = 1442214910  # <--- BU YERGA O'ZINGIZNING ID-INGIZNI YOZING! (masalan: 51234567)
+CARD_NUMBER = "5614682115991368" # <--- KARTANGIZNI YOZING
+CARD_HOLDER = "Rustamxon Xujaxonov"
+
+BAD_WORDS = ["janxknwkxnkwnxkwnxknwxknwx"]
 
 db = None
 r = None
@@ -28,7 +32,6 @@ async def init():
         r = redis.from_url(REDIS_URL, decode_responses=True)
 
         async with db.acquire() as conn:
-            # Jadvalni yaratish
             await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
@@ -37,22 +40,21 @@ async def init():
                 state TEXT DEFAULT 'gender',
                 partner BIGINT,
                 reports INT DEFAULT 0,
-                is_banned BOOLEAN DEFAULT FALSE
+                is_banned BOOLEAN DEFAULT FALSE,
+                is_premium BOOLEAN DEFAULT FALSE
             )
             """)
-            # Ustunlarni tekshirish va qo'shish (Error oldini olish)
+            # Ustunlarni tekshirish
             for col in [
-                ("search_pref", "TEXT DEFAULT 'random'"),
-                ("is_banned", "BOOLEAN DEFAULT FALSE"),
-                ("reports", "INT DEFAULT 0")
+                ("is_premium", "BOOLEAN DEFAULT FALSE"),
+                ("is_banned", "BOOLEAN DEFAULT FALSE")
             ]:
                 try:
                     await conn.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col[0]} {col[1]}")
-                except:
-                    pass
-        logger.info("✅ Baza muvaffaqiyatli ulandi va yangilandi!")
+                except: pass
+        logger.info("✅ Baza tayyor!")
     except Exception as e:
-        logger.error(f"❌ Bazada xatolik: {e}")
+        logger.error(f"❌ Xatolik: {e}")
 
 async def get_user(uid):
     async with db.acquire() as conn:
@@ -66,30 +68,25 @@ async def update_user(uid, **kwargs):
         await conn.execute(f"UPDATE users SET {cols} WHERE user_id=$1", uid, *vals)
 
 # ===== KEYBOARD =====
-def get_kb(state):
+def get_kb(state, is_premium=False):
     if state == "gender":
         return ReplyKeyboardMarkup([["👨 Erkak", "👩 Ayol"]], resize_keyboard=True)
     if state == "menu":
+        vip_text = "🔎 Jins bo‘yicha qidirish" if is_premium else "🔎 Jins bo‘yicha (⭐ VIP)"
         return ReplyKeyboardMarkup([
             ["🎲 Random qidirish"],
-            ["🔎 Jins bo‘yicha qidirish"],
-            ["🔄 Jinsni o‘zgartirish"]
+            [vip_text],
+            ["🔄 Jinsni o‘zgartirish", "💎 VIP sotib olish"]
         ], resize_keyboard=True)
     if state == "search_gender":
-        return ReplyKeyboardMarkup([
-            ["👨 O‘g‘il qidirish", "👩 Qiz qidirish"],
-            ["🔙 Orqaga"]
-        ], resize_keyboard=True)
+        return ReplyKeyboardMarkup([["👨 O‘g‘il qidirish", "👩 Qiz qidirish"], ["🔙 Orqaga"]], resize_keyboard=True)
     if state == "searching":
         return ReplyKeyboardMarkup([["❌ Bekor qilish"]], resize_keyboard=True)
     if state == "chat":
-        return ReplyKeyboardMarkup([
-            ["⛔ Tugatish", "🔄 Keyingi"],
-            ["🚨 Shikoyat"]
-        ], resize_keyboard=True)
+        return ReplyKeyboardMarkup([["⛔ Tugatish", "🔄 Keyingi"], ["🚨 Shikoyat"]], resize_keyboard=True)
     return ReplyKeyboardRemove()
 
-# ===== MATCHMAKING (Qidiruv mantiqi) =====
+# ===== MATCHMAKING =====
 async def find_match(uid, context: ContextTypes.DEFAULT_TYPE):
     user = await get_user(uid)
     if not user: return False
@@ -97,40 +94,34 @@ async def find_match(uid, context: ContextTypes.DEFAULT_TYPE):
     my_gender = user['gender']
     pref = user['search_pref']
 
-    # Navbat kalitlari
-    # Men o'g'il qidirsam, queue:male ichidagilarni qidiraman
     search_key = f"queue:{pref}" 
-    # Men o'zim qaysi navbatda turaman
     my_queue_key = f"queue:{my_gender}" if pref != "random" else "queue:random"
     
-    # Sherik qidirish
     partner_id = await r.lpop(search_key)
 
     if partner_id:
         partner_id = int(partner_id)
-        if partner_id == uid: # O'zi bilan o'zi tushib qolsa
+        if partner_id == uid:
             await r.rpush(my_queue_key, uid)
             return False
             
-        # Bazada bandligini tekshirish
         p_data = await get_user(partner_id)
         if not p_data or p_data['state'] != "searching":
-            return await find_match(uid, context) # Qayta qidirish
+            return await find_match(uid, context)
 
         await update_user(uid, partner=partner_id, state="chat")
         await update_user(partner_id, partner=uid, state="chat")
 
-        msg = "🎉 **Suhbatdosh topildi!**\n\nMarhamat, suhbatni boshlang.\n\n_Tugmalar:_\n⛔ **Tugatish** - Chatni yopish\n🔄 **Keyingi** - Yangi odam\n🚨 **Shikoyat** - Bloklash"
+        msg = "🎉 **Suhbatdosh topildi!**\n\nMarhamat, suhbatni boshlang."
         await context.bot.send_message(uid, msg, reply_markup=get_kb("chat"), parse_mode="Markdown")
         await context.bot.send_message(partner_id, msg, reply_markup=get_kb("chat"), parse_mode="Markdown")
         return True
     else:
-        # Hech kim yo'q bo'lsa, navbatga qo'shish
         queue_to_join = f"queue:{my_gender}" if pref != "random" else "queue:random"
         await r.rpush(queue_to_join, uid)
         return False
 
-# ===== ASOSIY HANDLERS =====
+# ===== HANDLERS =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = await get_user(uid)
@@ -138,124 +129,142 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         async with db.acquire() as conn:
             await conn.execute("INSERT INTO users (user_id, state) VALUES ($1, 'gender') ON CONFLICT DO NOTHING", uid)
-        await update.message.reply_text("👋 **Anonim Chatga xush kelibsiz!**\n\nAvval jinsingizni tanlang:", reply_markup=get_kb("gender"), parse_mode="Markdown")
+        await update.message.reply_text("👋 **Xush kelibsiz!** Jinsingizni tanlang:", reply_markup=get_kb("gender"), parse_mode="Markdown")
     else:
-        if user['is_banned']:
-            return await update.message.reply_text("🚫 Siz bloklangansiz!")
+        if user['is_banned']: return await update.message.reply_text("🚫 Bloklangansiz!")
         await update_user(uid, state="menu", partner=None)
-        await update.message.reply_text("Siz asosiy menyudasiz:", reply_markup=get_kb("menu"))
+        await update.message.reply_text("Asosiy menyu:", reply_markup=get_kb("menu", user['is_premium']))
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = update.message.text
-    if not text: return
-
     user = await get_user(uid)
-    if not user: return
-    if user['is_banned']: return
 
-    # Haqorat filtri
-    if any(word in text.lower() for word in BAD_WORDS):
-        await update.message.reply_text("❌ Odobsiz so'z ishlatmang!")
+    if not user or user['is_banned']: return
+
+    # To'lov chekini qabul qilish (waiting_check holatida rasm kelsa)
+    if user['state'] == "waiting_check" and update.message.photo:
+        photo_id = update.message.photo[-1].file_id
+        await update_user(uid, state="menu")
+        await update.message.reply_text("✅ Chek qabul qilindi. Admin tasdiqlashini kuting.", reply_markup=get_kb("menu", user['is_premium']))
+        
+        # Adminga yuborish
+        kb = [[InlineKeyboardButton("✅ Tasdiqlash", callback_data=f"accept_{uid}"),
+               InlineKeyboardButton("❌ Rad etish", callback_data=f"reject_{uid}")]]
+        await context.bot.send_photo(ADMIN_ID, photo_id, caption=f"💰 To'lov!\nUser: {uid}\nUsername: @{update.effective_user.username}", reply_markup=InlineKeyboardMarkup(kb))
         return
 
-    state = user['state']
+    if not text: return
 
     # STATE: GENDER
-    if state == "gender":
+    if user['state'] == "gender":
         if text in ["👨 Erkak", "👩 Ayol"]:
             gender_val = "male" if "Erkak" in text else "female"
             await update_user(uid, gender=gender_val, state="menu")
-            await update.message.reply_text("✅ Saqlandi! Endi suhbatdosh qidirishingiz mumkin.", reply_markup=get_kb("menu"))
+            await update.message.reply_text("Tayyor! Kimni qidiramiz?", reply_markup=get_kb("menu", False))
         return
 
     # STATE: MENU
-    elif state == "menu":
+    elif user['state'] == "menu":
         if text == "🎲 Random qidirish":
             await update_user(uid, state="searching", search_pref="random")
-            await update.message.reply_text("🔍 **Suhbatdosh qidirilyapti...**", reply_markup=get_kb("searching"), parse_mode="Markdown")
+            await update.message.reply_text("🔍 Qidirilmoqda...", reply_markup=get_kb("searching"))
             await find_match(uid, context)
-        elif text == "🔎 Jins bo‘yicha qidirish":
-            await update_user(uid, state="search_gender")
-            await update.message.reply_text("Kim bilan gaplashmoqchisiz?", reply_markup=get_kb("search_gender"))
+            
+        elif "Jins bo‘yicha" in text:
+            if not user['is_premium']:
+                await update.message.reply_text("⭐ Bu funksiya faqat VIP a'zolar uchun! Sotib olish uchun '💎 VIP sotib olish' tugmasini bosing.")
+            else:
+                await update_user(uid, state="search_gender")
+                await update.message.reply_text("Kimni qidiramiz?", reply_markup=get_kb("search_gender"))
+
+        elif text == "💎 VIP sotib olish":
+            await update_user(uid, state="waiting_check")
+            await update.message.reply_text(
+                f"💎 **VIP status (10,000 UZS)**\n\n"
+                f"Imkoniyat: Jins bo'yicha cheksiz qidirish.\n\n"
+                f"💳 Karta: `{CARD_NUMBER}`\n👤 Ega: {CARD_HOLDER}\n\n"
+                f"To'lovni amalga oshirib, **chekni (rasm)** shu yerga yuboring!",
+                parse_mode="Markdown", reply_markup=ReplyKeyboardMarkup([["🔙 Bekor qilish"]], resize_keyboard=True)
+            )
+            
         elif text == "🔄 Jinsni o‘zgartirish":
             await update_user(uid, state="gender")
             await update.message.reply_text("Jinsingizni tanlang:", reply_markup=get_kb("gender"))
 
     # STATE: SEARCH_GENDER
-    elif state == "search_gender":
+    elif user['state'] == "search_gender":
         if text == "🔙 Orqaga":
             await update_user(uid, state="menu")
-            await update.message.reply_text("Menyu:", reply_markup=get_kb("menu"))
+            await update.message.reply_text("Menyu:", reply_markup=get_kb("menu", user['is_premium']))
         elif text in ["👨 O‘g‘il qidirish", "👩 Qiz qidirish"]:
             pref = "male" if "O‘g‘il" in text else "female"
             await update_user(uid, state="searching", search_pref=pref)
-            await update.message.reply_text("🔍 **Qidiruv boshlandi...**", reply_markup=get_kb("searching"), parse_mode="Markdown")
+            await update.message.reply_text("🔍 Qidirilmoqda...", reply_markup=get_kb("searching"))
             await find_match(uid, context)
 
     # STATE: SEARCHING
-    elif state == "searching":
+    elif user['state'] == "searching":
         if text == "❌ Bekor qilish":
             pref = user['search_pref']
-            my_gender = user['gender']
-            q_key = f"queue:{my_gender}" if pref != "random" else "queue:random"
+            q_key = f"queue:{user['gender']}" if pref != "random" else "queue:random"
             await r.lrem(q_key, 0, str(uid))
             await update_user(uid, state="menu")
-            await update.message.reply_text("❌ Qidiruv bekor qilindi.", reply_markup=get_kb("menu"))
+            await update.message.reply_text("Bekor qilindi.", reply_markup=get_kb("menu", user['is_premium']))
 
     # STATE: CHAT
-    elif state == "chat":
-        partner_id = user['partner']
-        if not partner_id:
-            await update_user(uid, state="menu")
-            return
-
+    elif user['state'] == "chat":
+        p_id = user['partner']
+        if not p_id: return
+        
         if text == "⛔ Tugatish":
             await update_user(uid, state="menu", partner=None)
-            await update_user(partner_id, state="menu", partner=None)
-            await update.message.reply_text("❌ Suhbat tugadi.", reply_markup=get_kb("menu"))
-            await context.bot.send_message(partner_id, "❌ Suhbatdosh suhbatni tugatdi.", reply_markup=get_kb("menu"))
+            await update_user(p_id, state="menu", partner=None)
+            await update.message.reply_text("❌ Suhbat tugadi.", reply_markup=get_kb("menu", user['is_premium']))
+            await context.bot.send_message(p_id, "❌ Suhbatdosh suhbatni tugatdi.", reply_markup=get_kb("menu", (await get_user(p_id))['is_premium']))
         
         elif text == "🔄 Keyingi":
-            await update_user(partner_id, state="menu", partner=None)
-            await context.bot.send_message(partner_id, "⚠️ Suhbatdosh boshqa chatga o'tdi.", reply_markup=get_kb("menu"))
+            await update_user(p_id, state="menu", partner=None)
+            await context.bot.send_message(p_id, "⚠️ Suhbatdosh boshqa chatga o'tdi.", reply_markup=get_kb("menu", (await get_user(p_id))['is_premium']))
             await update_user(uid, state="searching")
-            await update.message.reply_text("🔄 Keyingi suhbatdosh qidirilyapti...", reply_markup=get_kb("searching"))
+            await update.message.reply_text("🔄 Keyingi qidiruv...", reply_markup=get_kb("searching"))
             await find_match(uid, context)
 
         elif text == "🚨 Shikoyat":
-            p_data = await get_user(partner_id)
-            new_reports = p_data['reports'] + 1
-            await update_user(partner_id, reports=new_reports)
-            if new_reports >= 20:
-                await update_user(partner_id, is_banned=True)
-            
+            await update_user(p_id, reports=user['reports']+1)
             await update_user(uid, state="menu", partner=None)
-            await update_user(partner_id, state="menu", partner=None)
-            await update.message.reply_text("🚨 Shikoyat yuborildi, chat yopildi.", reply_markup=get_kb("menu"))
-            await context.bot.send_message(partner_id, "🚨 Siz ustingizdan shikoyat tushdi, chat yopildi.", reply_markup=get_kb("menu"))
+            await update_user(p_id, state="menu", partner=None)
+            await update.message.reply_text("🚨 Shikoyat qabul qilindi.", reply_markup=get_kb("menu", user['is_premium']))
         
         else:
-            # Xabarni sherigiga yuborish
-            try:
-                await context.bot.send_message(partner_id, text)
-            except:
-                await update_user(uid, state="menu", partner=None)
-                await update.message.reply_text("⚠️ Aloqa uzildi.", reply_markup=get_kb("menu"))
+            try: await context.bot.send_message(p_id, text)
+            except: pass
+
+# ===== CALLBACK HANDLER (ADMIN UCHUN) =====
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    await query.answer()
+
+    action, target_id = data.split("_")
+    target_id = int(target_id)
+
+    if action == "accept":
+        await update_user(target_id, is_premium=True)
+        await context.bot.send_message(target_id, "🎉 Tabriklaymiz! To'lovingiz tasdiqlandi. Endi siz VIP a'zosiz!")
+        await query.edit_message_caption("✅ Tasdiqlandi!")
+    else:
+        await context.bot.send_message(target_id, "❌ Uzr, to'lovingiz tasdiqlanmadi.")
+        await query.edit_message_caption("❌ Rad etildi.")
 
 def main():
-    if not TOKEN:
-        print("XATO: BOT_TOKEN o'rnatilmagan!")
-        return
-
     app = Application.builder().token(TOKEN).build()
-    
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_handler))
     
     async def post_init(application):
         await init()
-        # Conflict xatosini oldini olish uchun webhookni tozalash
         await application.bot.delete_webhook(drop_pending_updates=True)
         print("🚀 Bot ishga tushdi!")
 
