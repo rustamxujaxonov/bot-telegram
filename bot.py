@@ -1,10 +1,3 @@
-"""
-╔══════════════════════════════════════════════════════╗
-║         ANONIM CHAT BOT  — Mukammal versiya          ║
-║         Python-telegram-bot 20+  |  asyncpg  |  Redis║
-╚══════════════════════════════════════════════════════╝
-"""
-
 import os
 import logging
 import asyncio
